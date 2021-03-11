@@ -11,7 +11,6 @@ class ModelWrapper:
     def __init__(self, model, feature_module):
         self.model = model
         self.feature_module = feature_module
-        # self.feature_extractor = FeatureExtractor(self.feature_module, feature_layer)
         self.feature_gradients = None
         self.feature_output = None
         self.register_hooks()
@@ -100,28 +99,16 @@ class GradCam:
 class GuidedBackpropReLU(Function):
     @staticmethod
     def forward(self, input_img):
-        # positive_mask = (input_img > 0).type_as(input_img)
-        # output_1 = torch.addcmul(torch.zeros(input_img.size()).type_as(input_img), input_img, positive_mask)
-
         positive_mask = (input_img > 0).type_as(input_img)
         output = input_img * positive_mask
-        # self.save_for_backward(input_img, output)
-        # assert ((output==output_1).all())
         self.save_for_backward(positive_mask)
         return output
 
     @staticmethod
     def backward(self, grad_output):
         positive_mask_1 = self.saved_tensors[0]
-
-        # positive_mask_1 = (input_img > 0).type_as(grad_output)
         positive_mask_2 = (grad_output > 0).type_as(grad_output)
-        # grad_input_1 = torch.addcmul(torch.zeros(input_img.size()).type_as(input_img),
-        #                            torch.addcmul(torch.zeros(input_img.size()).type_as(input_img), grad_output,
-        #                                          positive_mask_1), positive_mask_2)
-
         grad_input = grad_output * positive_mask_1 * positive_mask_2
-        # assert ((grad_input_1==grad_input).all())
         return grad_input
 
 
@@ -168,11 +155,8 @@ def get_args():
     parser.add_argument('--image-path', type=str, default='./examples/both.png',
                         help='Input image path')
     args = parser.parse_args()
-    # args.use_cuda = args.use_cuda and torch.cuda.is_available()
-    # if args.use_cuda:
-    #     print("Using GPU for acceleration")
-    # else:
-    #     print("Using CPU for computation")
+    args.use_cuda = args.use_cuda and torch.cuda.is_available()
+    print(f"Device {args.device}")
 
     return args
 
@@ -198,10 +182,6 @@ if __name__ == '__main__':
     args = get_args()
 
     model = models.resnet50(pretrained=True).to(args.device)
-    # very awkward encapsulation.
-    # modules are all separate, but the parameter passed all the way up is opaque
-    # what does ["2"] mean?
-    # might as well not modulate if API caller needs to know the internals
     grad_cam = GradCam(model=model, feature_module=model.layer4)
 
     img = cv2.imread(args.image_path, 1)

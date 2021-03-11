@@ -1,68 +1,48 @@
-import torch
 import argparse
+
 import cv2
 import numpy as np
 import torch
 from torch.autograd import Function
 from torchvision import models, transforms
 
-class FeatureExtractor():
-    """ Class for extracting activations and
-    registering gradients from targetted intermediate layers """
 
-    def __init__(self, model, target_layers):
-        self.model = model
-        self.target_layers = target_layers
-        self.gradients = []
-
-    def save_gradient(self, grad):
-        self.gradients.append(grad)
-
-    def __call__(self, x):
-        outputs = []
-        self.gradients = []
-        for name, module in self.model._modules.items():
-            x = module(x)
-            if name in self.target_layers:
-                x.register_hook(self.save_gradient)
-                outputs += [x]
-        return outputs, x
-
-class ModelOutputs():
-    """ Class for making a forward pass, and getting:
-    1. The network output.
-    2. Activations from intermeddiate targetted layers.
-    3. Gradients from intermeddiate targetted layers. """
-
-    def __init__(self, model, feature_module, target_layers):
+class ModelWrapper:
+    def __init__(self, model, feature_module):
         self.model = model
         self.feature_module = feature_module
-        self.feature_extractor = FeatureExtractor(self.feature_module, target_layers)
+        # self.feature_extractor = FeatureExtractor(self.feature_module, feature_layer)
+        self.feature_gradients = None
+        self.feature_output = None
+        self.register_hooks()
 
-    def get_gradients(self):
-        return self.feature_extractor.gradients
+    def register_hooks(self):
+        target_layer = next(reversed(self.feature_module._modules))
+        target_layer = self.feature_module._modules[target_layer]
+        target_layer.register_backward_hook(self.save_gradient)
+        target_layer.register_forward_hook(self.save_output)
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.feature_gradients = grad_input[0]
+
+    def save_output(self, module, input, output):
+        self.feature_output = output
 
     def __call__(self, x):
-        target_activations = []
-        for name, module in self.model._modules.items():
-            if module == self.feature_module:
-                target_activations, x = self.feature_extractor(x)
-            elif "avgpool" in name.lower():
-                x = module(x)
-                x = x.view(x.size(0),-1)
-            else:
-                x = module(x)
+        self.feature_gradients = None
+        self.feature_output = None
+        return self.model(x)
 
-        return target_activations, x
 
 def preprocess_image(img):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+                                     std=[0.229, 0.224, 0.225])
     preprocessing = transforms.Compose([
         transforms.ToTensor(),
         normalize,
     ])
     return preprocessing(img.copy()).unsqueeze(0)
+
 
 def show_cam_on_image(img, mask):
     heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
@@ -71,8 +51,9 @@ def show_cam_on_image(img, mask):
     cam = cam / np.max(cam)
     return np.uint8(255 * cam)
 
+
 class GradCam:
-    def __init__(self, model, feature_module, target_layer_names, use_cuda):
+    def __init__(self, model, feature_module, use_cuda):
         self.model = model
         self.feature_module = feature_module
         self.model.eval()
@@ -80,7 +61,7 @@ class GradCam:
         if self.cuda:
             self.model = model.cuda()
 
-        self.extractor = ModelOutputs(self.model, self.feature_module, target_layer_names)
+        self.model_wrapper = ModelWrapper(self.model, self.feature_module)
 
     def forward(self, input_img):
         return self.model(input_img)
@@ -89,7 +70,7 @@ class GradCam:
         if self.cuda:
             input_img = input_img.cuda()
 
-        features, output = self.extractor(input_img)
+        output = self.model_wrapper(input_img)
 
         if target_category == None:
             target_category = np.argmax(output.cpu().data.numpy())
@@ -99,23 +80,22 @@ class GradCam:
         one_hot = torch.from_numpy(one_hot).requires_grad_(True)
         if self.cuda:
             one_hot = one_hot.cuda()
-        
+
         one_hot = torch.sum(one_hot * output)
 
         self.feature_module.zero_grad()
         self.model.zero_grad()
         one_hot.backward(retain_graph=True)
 
-        grads_val = self.extractor.get_gradients()[-1].cpu().data.numpy()
+        grads_val = self.model_wrapper.feature_gradients.cpu().data.numpy()
+        features = self.model_wrapper.feature_output
 
-        target = features[-1]
-        target = target.cpu().data.numpy()[0, :]
+        features = features[-1].cpu().data.numpy()
 
-        weights = np.mean(grads_val, axis=(2, 3))[0, :]
-        cam = np.zeros(target.shape[1:], dtype=np.float32)
+        global_average_pooled_gradients = np.mean(grads_val, axis=(2, 3))[0, :]
 
-        for i, w in enumerate(weights):
-            cam += w * target[i, :, :]
+        cam = np.expand_dims(global_average_pooled_gradients, axis=(1, 2)) * features
+        cam = cam.sum(axis=0)
 
         cam = np.maximum(cam, 0)
         cam = cv2.resize(cam, input_img.shape[2:])
@@ -190,6 +170,7 @@ class GuidedBackpropReLUModel:
 
         return output
 
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--use-cuda', action='store_true', default=False,
@@ -205,6 +186,7 @@ def get_args():
 
     return args
 
+
 def deprocess_image(img):
     """ see https://github.com/jacobgil/keras-grad-cam/blob/master/grad-cam.py#L65 """
     img = img - np.mean(img)
@@ -212,7 +194,8 @@ def deprocess_image(img):
     img = img * 0.1
     img = img + 0.5
     img = np.clip(img, 0, 1)
-    return np.uint8(img*255)
+    return np.uint8(img * 255)
+
 
 if __name__ == '__main__':
     """ python grad_cam.py <path_to_image>
@@ -225,8 +208,11 @@ if __name__ == '__main__':
     args = get_args()
 
     model = models.resnet50(pretrained=True)
-    grad_cam = GradCam(model=model, feature_module=model.layer4, \
-                       target_layer_names=["2"], use_cuda=args.use_cuda)
+    # very awkward encapsulation.
+    # modules are all separate, but the parameter passed all the way up is opaque
+    # what does ["2"] mean?
+    # might as well not modulate if API caller needs to know the internals
+    grad_cam = GradCam(model=model, feature_module=model.layer4, use_cuda=args.use_cuda)
 
     img = cv2.imread(args.image_path, 1)
     img = np.float32(img) / 255
@@ -247,7 +233,7 @@ if __name__ == '__main__':
     gb = gb.transpose((1, 2, 0))
 
     cam_mask = cv2.merge([grayscale_cam, grayscale_cam, grayscale_cam])
-    cam_gb = deprocess_image(cam_mask*gb)
+    cam_gb = deprocess_image(cam_mask * gb)
     gb = deprocess_image(gb)
 
     cv2.imwrite("cam.jpg", cam)

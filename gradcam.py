@@ -53,13 +53,10 @@ def show_cam_on_image(img, mask):
 
 
 class GradCam:
-    def __init__(self, model, feature_module, use_cuda):
+    def __init__(self, model, feature_module):
         self.model = model
         self.feature_module = feature_module
         self.model.eval()
-        self.cuda = use_cuda
-        if self.cuda:
-            self.model = model.cuda()
 
         self.model_wrapper = ModelWrapper(self.model, self.feature_module)
 
@@ -67,19 +64,15 @@ class GradCam:
         return self.model(input_img)
 
     def __call__(self, input_img, target_category=None):
-        if self.cuda:
-            input_img = input_img.cuda()
-
         output = self.model_wrapper(input_img)
 
-        if target_category == None:
+        if target_category is None:
             target_category = np.argmax(output.cpu().data.numpy())
 
         one_hot = np.zeros((1, output.size()[-1]), dtype=np.float32)
         one_hot[0][target_category] = 1
         one_hot = torch.from_numpy(one_hot).requires_grad_(True)
-        if self.cuda:
-            one_hot = one_hot.cuda()
+        one_hot = one_hot.to(input_img.device)
 
         one_hot = torch.sum(one_hot * output)
 
@@ -107,63 +100,60 @@ class GradCam:
 class GuidedBackpropReLU(Function):
     @staticmethod
     def forward(self, input_img):
+        # positive_mask = (input_img > 0).type_as(input_img)
+        # output_1 = torch.addcmul(torch.zeros(input_img.size()).type_as(input_img), input_img, positive_mask)
+
         positive_mask = (input_img > 0).type_as(input_img)
-        output = torch.addcmul(torch.zeros(input_img.size()).type_as(input_img), input_img, positive_mask)
-        self.save_for_backward(input_img, output)
+        output = input_img * positive_mask
+        # self.save_for_backward(input_img, output)
+        # assert ((output==output_1).all())
+        self.save_for_backward(positive_mask)
         return output
 
     @staticmethod
     def backward(self, grad_output):
-        input_img, output = self.saved_tensors
-        grad_input = None
+        positive_mask_1 = self.saved_tensors[0]
 
-        positive_mask_1 = (input_img > 0).type_as(grad_output)
+        # positive_mask_1 = (input_img > 0).type_as(grad_output)
         positive_mask_2 = (grad_output > 0).type_as(grad_output)
-        grad_input = torch.addcmul(torch.zeros(input_img.size()).type_as(input_img),
-                                   torch.addcmul(torch.zeros(input_img.size()).type_as(input_img), grad_output,
-                                                 positive_mask_1), positive_mask_2)
+        # grad_input_1 = torch.addcmul(torch.zeros(input_img.size()).type_as(input_img),
+        #                            torch.addcmul(torch.zeros(input_img.size()).type_as(input_img), grad_output,
+        #                                          positive_mask_1), positive_mask_2)
+
+        grad_input = grad_output * positive_mask_1 * positive_mask_2
+        # assert ((grad_input_1==grad_input).all())
         return grad_input
 
 
 class GuidedBackpropReLUModel:
-    def __init__(self, model, use_cuda):
+    def __init__(self, model):
         self.model = model
         self.model.eval()
-        self.cuda = use_cuda
-        if self.cuda:
-            self.model = model.cuda()
+        self.recursive_relu_apply(self.model)
 
-        def recursive_relu_apply(module_top):
-            for idx, module in module_top._modules.items():
-                recursive_relu_apply(module)
-                if module.__class__.__name__ == 'ReLU':
-                    module_top._modules[idx] = GuidedBackpropReLU.apply
-
+    def recursive_relu_apply(self, module_top):
         # replace ReLU with GuidedBackpropReLU
-        recursive_relu_apply(self.model)
-
-    def forward(self, input_img):
-        return self.model(input_img)
+        for idx, module in module_top._modules.items():
+            self.recursive_relu_apply(module)
+            if module.__class__.__name__ == 'ReLU':
+                module_top._modules[idx] = GuidedBackpropReLU.apply
 
     def __call__(self, input_img, target_category=None):
-        if self.cuda:
-            input_img = input_img.cuda()
+        input_img.requires_grad = True
+        input_img.retain_grad()
 
-        input_img = input_img.requires_grad_(True)
+        output = self.model(input_img)
 
-        output = self.forward(input_img)
-
-        if target_category == None:
+        if target_category is None:
             target_category = np.argmax(output.cpu().data.numpy())
 
         one_hot = np.zeros((1, output.size()[-1]), dtype=np.float32)
         one_hot[0][target_category] = 1
         one_hot = torch.from_numpy(one_hot).requires_grad_(True)
-        if self.cuda:
-            one_hot = one_hot.cuda()
+        one_hot = one_hot.to(input_img.device)
 
         one_hot = torch.sum(one_hot * output)
-        one_hot.backward(retain_graph=True)
+        one_hot.backward()
 
         output = input_img.grad.cpu().data.numpy()
         output = output[0, :, :, :]
@@ -173,16 +163,16 @@ class GuidedBackpropReLUModel:
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--use-cuda', action='store_true', default=False,
+    parser.add_argument('--device', type=str, default="cuda:0",
                         help='Use NVIDIA GPU acceleration')
     parser.add_argument('--image-path', type=str, default='./examples/both.png',
                         help='Input image path')
     args = parser.parse_args()
-    args.use_cuda = args.use_cuda and torch.cuda.is_available()
-    if args.use_cuda:
-        print("Using GPU for acceleration")
-    else:
-        print("Using CPU for computation")
+    # args.use_cuda = args.use_cuda and torch.cuda.is_available()
+    # if args.use_cuda:
+    #     print("Using GPU for acceleration")
+    # else:
+    #     print("Using CPU for computation")
 
     return args
 
@@ -207,18 +197,18 @@ if __name__ == '__main__':
 
     args = get_args()
 
-    model = models.resnet50(pretrained=True)
+    model = models.resnet50(pretrained=True).to(args.device)
     # very awkward encapsulation.
     # modules are all separate, but the parameter passed all the way up is opaque
     # what does ["2"] mean?
     # might as well not modulate if API caller needs to know the internals
-    grad_cam = GradCam(model=model, feature_module=model.layer4, use_cuda=args.use_cuda)
+    grad_cam = GradCam(model=model, feature_module=model.layer4)
 
     img = cv2.imread(args.image_path, 1)
     img = np.float32(img) / 255
     # Opencv loads as BGR:
     img = img[:, :, ::-1]
-    input_img = preprocess_image(img)
+    input_img = preprocess_image(img).to(args.device)
 
     # If None, returns the map for the highest scoring category.
     # Otherwise, targets the requested category.
@@ -228,7 +218,7 @@ if __name__ == '__main__':
     grayscale_cam = cv2.resize(grayscale_cam, (img.shape[1], img.shape[0]))
     cam = show_cam_on_image(img, grayscale_cam)
 
-    gb_model = GuidedBackpropReLUModel(model=model, use_cuda=args.use_cuda)
+    gb_model = GuidedBackpropReLUModel(model=model)
     gb = gb_model(input_img, target_category=target_category)
     gb = gb.transpose((1, 2, 0))
 
@@ -236,6 +226,6 @@ if __name__ == '__main__':
     cam_gb = deprocess_image(cam_mask * gb)
     gb = deprocess_image(gb)
 
-    cv2.imwrite("cam.jpg", cam)
+    cv2.imwrite("grad_cam.jpg", cam)
     cv2.imwrite('gb.jpg', gb)
-    cv2.imwrite('cam_gb.jpg', cam_gb)
+    cv2.imwrite('grad_cam_gb.jpg', cam_gb)

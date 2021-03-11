@@ -155,7 +155,6 @@ def get_args():
     parser.add_argument('--image-path', type=str, default='./examples/both.png',
                         help='Input image path')
     args = parser.parse_args()
-    args.use_cuda = args.use_cuda and torch.cuda.is_available()
     print(f"Device {args.device}")
 
     return args
